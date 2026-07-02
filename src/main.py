@@ -1,25 +1,20 @@
 """
-Instant Music Recommender - Spotify Live Edition
+Instant Music Recommender - Streamlit app (v2).
 
-Instead of a static CSV dataset, this version searches Spotify's real
-catalog live using the Spotify Web API (Client Credentials flow).
-
-Note on scope: Spotify deprecated its audio-features and recommendations
-endpoints for new apps in late 2024, so true "audio-similarity" recommendations
-are no longer possible via the official API. This app instead offers:
-  - Live search across Spotify's catalog (biased toward the Indian market)
-  - An embedded official Spotify player for each result
-  - "More from this artist" / "More from this album" as the recommendation angle
-
-Requires a free Spotify Developer app (Client ID + Client Secret).
-See README.md for setup instructions.
+Loads the artifacts produced by preprocess.py and lets the user pick a song,
+then recommends the most similar songs based on audio features
+(danceability, energy, tempo, valence, etc.) using cosine similarity.
 """
 
-import time
-import base64
-import requests
+import os
+import pickle
+import urllib.parse
+import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
+ARTIFACT_DIR = os.path.join(PROJECT_DIR, "artifacts")
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -31,60 +26,7 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------------------------
-# PWA support — manifest, icons, theme-color (lets phones "Add to Home Screen")
-# ---------------------------------------------------------------------------
-components.html(
-    """
-    <script>
-    (function() {
-        const head = window.parent.document.head;
-
-        function addTag(tagName, attrs) {
-            const existing = head.querySelector(
-                `${tagName}[rel="${attrs.rel || ''}"][name="${attrs.name || ''}"]`
-            );
-            if (existing) return;
-            const el = document.createElement(tagName);
-            Object.entries(attrs).forEach(([k, v]) => el.setAttribute(k, v));
-            head.appendChild(el);
-        }
-
-        addTag('link', { rel: 'manifest', href: './app/static/manifest.json' });
-        addTag('meta', { name: 'theme-color', content: '#6C4AB6' });
-        addTag('meta', { name: 'viewport', content: 'width=device-width, initial-scale=1, maximum-scale=1' });
-        addTag('link', { rel: 'apple-touch-icon', href: './app/static/icon-192.png' });
-        addTag('meta', { name: 'apple-mobile-web-app-capable', content: 'yes' });
-        addTag('meta', { name: 'apple-mobile-web-app-title', content: 'MusicRec' });
-    })();
-    </script>
-    """,
-    height=0,
-)
-
-# ---------------------------------------------------------------------------
-# Mobile-responsive tweaks
-# ---------------------------------------------------------------------------
-st.markdown(
-    """
-    <style>
-    @media (max-width: 640px) {
-        .stApp { padding: 0.5rem !important; }
-        div[data-testid="column"] { min-width: 100% !important; flex: 1 1 100% !important; }
-        .song-card .title { font-size: 15px !important; }
-        .song-card .meta { font-size: 12px !important; }
-        iframe { height: 80px !important; }
-    }
-    .stButton > button { width: 100%; }
-    @media (min-width: 641px) {
-        .stButton > button { width: auto; }
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-# ---------------------------------------------------------------------------
-# Styling — lavender theme
+# Styling — lavender theme + green input text
 # ---------------------------------------------------------------------------
 st.markdown(
     """
@@ -95,11 +37,11 @@ st.markdown(
     h1, h2, h3, h4, p, span, label, div {
         color: #2E2148 !important;
     }
-    .stTextInput > label, .stSelectbox > label {
+    .stSelectbox > label, .stSlider > label {
         color: #2E2148 !important;
         font-weight: 600 !important;
     }
-    div[data-baseweb="select"] > div, div[data-baseweb="input"] > div {
+    div[data-baseweb="select"] > div {
         background-color: #FFFFFF !important;
         border: 1px solid #B3A2E0 !important;
         border-radius: 10px !important;
@@ -107,7 +49,12 @@ st.markdown(
     div[data-baseweb="popover"] * {
         color: #FFFFFF !important;
     }
-    div[data-baseweb="select"] input, div[data-baseweb="input"] input {
+    div[data-baseweb="popover"] li:hover,
+    ul[role="listbox"] li:hover,
+    li[role="option"]:hover {
+        background-color: rgba(255,255,255,0.15) !important;
+    }
+    div[data-baseweb="select"] input {
         color: #2E2148 !important;
     }
     .stButton > button {
@@ -117,13 +64,14 @@ st.markdown(
         border-radius: 10px !important;
         padding: 0.6em 1.4em !important;
         font-weight: 600 !important;
+        transition: background-color 0.2s ease-in-out;
     }
     .stButton > button:hover {
         background-color: #5A3A9E !important;
     }
     .song-card {
         padding: 14px 18px;
-        margin-bottom: 12px;
+        margin-bottom: 10px;
         border-radius: 12px;
         background-color: rgba(255,255,255,0.55);
         border: 1px solid rgba(108,74,182,0.25);
@@ -168,225 +116,115 @@ st.markdown(
     """
     <div style="text-align:center; margin-bottom: 20px;">
         <div style="font-size: 36px; font-weight: 800; color:#2E2148;">Instant Music Recommender</div>
-        <div style="font-size: 15px; opacity: 0.7; margin-top: 2px;">
-            Search Spotify's live Indian music catalog 🎧
-        </div>
+        <div style="font-size: 15px; opacity: 0.7; margin-top: 2px;">Find your next favorite song 🎧</div>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
 # ---------------------------------------------------------------------------
-# Spotify credentials (never hardcode these in code)
+# Load artifacts (cached so it only runs once per session)
 # ---------------------------------------------------------------------------
-def get_credentials():
-    """Pull Client ID/Secret from Streamlit secrets if present, else sidebar input."""
-    client_id = st.secrets.get("SPOTIFY_CLIENT_ID", "") if hasattr(st, "secrets") else ""
-    client_secret = st.secrets.get("SPOTIFY_CLIENT_SECRET", "") if hasattr(st, "secrets") else ""
+@st.cache_resource
+def load_artifacts():
+    songs_path = os.path.join(ARTIFACT_DIR, "songs.pkl")
+    sim_path = os.path.join(ARTIFACT_DIR, "similarity.pkl")
 
-    if not client_id or not client_secret:
-        with st.sidebar:
-            st.markdown("### 🔑 Spotify API credentials")
-            st.caption(
-                "Get these free from developer.spotify.com/dashboard. "
-                "See README.md for step-by-step instructions."
-            )
-            client_id = st.text_input("Client ID", value=client_id, type="password")
-            client_secret = st.text_input("Client Secret", value=client_secret, type="password")
+    if not os.path.exists(songs_path) or not os.path.exists(sim_path):
+        return None, None
 
-    return client_id, client_secret
+    songs = pd.read_pickle(songs_path)
+    with open(sim_path, "rb") as f:
+        similarity = pickle.load(f)
+    return songs, similarity
 
 
-CLIENT_ID, CLIENT_SECRET = get_credentials()
+songs_df, similarity_matrix = load_artifacts()
 
-if not CLIENT_ID or not CLIENT_SECRET:
-    st.warning(
-        "Enter your Spotify Client ID and Client Secret in the sidebar to start searching. "
-        "See README.md if you don't have these yet — it only takes a couple of minutes to get them."
-    )
-    st.stop()
-
-
-# ---------------------------------------------------------------------------
-# Spotify auth (Client Credentials flow — no user login needed, search-only)
-# ---------------------------------------------------------------------------
-@st.cache_data(ttl=3300, show_spinner=False)  # token lasts 3600s, refresh a bit early
-def get_access_token(client_id, client_secret):
-    auth_str = f"{client_id}:{client_secret}"
-    b64_auth = base64.b64encode(auth_str.encode()).decode()
-
-    resp = requests.post(
-        "https://accounts.spotify.com/api/token",
-        headers={
-            "Authorization": f"Basic {b64_auth}",
-            "Content-Type": "application/x-www-form-urlencoded",
-        },
-        data={"grant_type": "client_credentials"},
-        timeout=10,
-    )
-    if resp.status_code != 200:
-        return None, resp.text
-    return resp.json().get("access_token"), None
-
-
-token, auth_error = get_access_token(CLIENT_ID, CLIENT_SECRET)
-
-if not token:
+if songs_df is None:
     st.error(
-        "Couldn't authenticate with Spotify. Double-check your Client ID and Client Secret "
-        "in the sidebar."
+        "No processed data found. Please run `python3 preprocess.py` from the "
+        "`src` folder first, then restart this app with `streamlit run main.py`."
     )
-    if auth_error:
-        with st.expander("Error details"):
-            st.code(auth_error)
     st.stop()
 
 
-def spotify_get(endpoint, params=None):
-    resp = requests.get(
-        f"https://api.spotify.com/v1/{endpoint}",
-        headers={"Authorization": f"Bearer {token}"},
-        params=params or {},
-        timeout=10,
-    )
-    if resp.status_code == 401:
-        st.cache_data.clear()  # token expired mid-session, force refresh next run
-        st.error("Session expired, please rerun your search.")
-        return None
-    if resp.status_code != 200:
-        st.error(f"Spotify API error ({resp.status_code}). Try again in a moment.")
-        return None
-    return resp.json()
+# ---------------------------------------------------------------------------
+# Recommendation logic
+# ---------------------------------------------------------------------------
+def recommend(song_display_name, top_n=5):
+    idx = songs_df.index[songs_df["display_name"] == song_display_name]
+    if len(idx) == 0:
+        return pd.DataFrame()
+    idx = idx[0]
+
+    scores = list(enumerate(similarity_matrix[idx]))
+    scores = sorted(scores, key=lambda x: x[1], reverse=True)
+
+    top_matches = [s for s in scores if s[0] != idx][:top_n]
+
+    rec_indices = [i for i, _ in top_matches]
+    rec_scores = [round(float(score) * 100, 1) for _, score in top_matches]
+
+    result = songs_df.iloc[rec_indices][
+        ["song_name", "display_name", "singer", "language", "popularity"]
+    ].copy()
+    result["match %"] = rec_scores
+    return result.reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
-# Search UI
+# UI
 # ---------------------------------------------------------------------------
-GENRE_HINTS = {
-    "All Indian music": "",
-    "Bollywood / Hindi": "bollywood hindi",
-    "Punjabi": "punjabi",
-    "Tamil": "tamil kollywood",
-    "Telugu": "telugu tollywood",
-    "Marathi": "marathi",
-    "Bengali": "bengali",
-    "Devotional": "bhakti devotional",
-    "Indian Pop": "indian pop",
-}
+st.markdown("🎵 **Select a song:**")
 
-st.markdown("🎵 **Search for a song:**")
-col1, col2 = st.columns([2, 1])
-with col1:
-    query = st.text_input("Song name", placeholder="e.g. Kesariya, Tum Hi Ho, Naatu Naatu...", label_visibility="collapsed")
-with col2:
-    genre_choice = st.selectbox("Style", options=list(GENRE_HINTS.keys()), label_visibility="collapsed")
+language_filter = st.selectbox(
+    "Filter by language (optional)",
+    options=["All"] + sorted(songs_df["language"].dropna().unique().tolist()),
+    label_visibility="collapsed",
+)
 
-search_clicked = st.button("🔍 Search Spotify")
+filtered_df = songs_df if language_filter == "All" else songs_df[songs_df["language"] == language_filter]
+song_options = sorted(filtered_df["display_name"].tolist())
 
-st.caption("Try: " + " · ".join(["Kesariya", "Tum Hi Ho", "Chaiyya Chaiyya", "Naatu Naatu", "Kal Ho Naa Ho"]))
+selected_song = st.selectbox("Pick a song", options=song_options, label_visibility="collapsed")
 
+num_recs = st.slider("Number of recommendations", min_value=3, max_value=15, value=5)
 
-def search_tracks(query_text, genre_hint, limit=10):
-    full_query = f"{query_text} {genre_hint}".strip()
-    data = spotify_get(
-        "search",
-        params={"q": full_query, "type": "track", "market": "IN", "limit": limit},
-    )
-    if not data:
-        return []
-    return data.get("tracks", {}).get("items", [])
+if st.button("🚀 Recommend Similar Songs", use_container_width=False):
+    with st.spinner("Finding songs with a similar vibe..."):
+        recs = recommend(selected_song, top_n=num_recs)
 
-
-def render_track_card(track, badge=""):
-    name = track["name"]
-    artists = ", ".join(a["name"] for a in track["artists"])
-    album = track["album"]["name"]
-    album_art = track["album"]["images"][0]["url"] if track["album"]["images"] else None
-    spotify_url = track["external_urls"]["spotify"]
-    track_id = track["id"]
-    popularity = track.get("popularity", "—")
-
-    cols = st.columns([1, 3])
-    with cols[0]:
-        if album_art:
-            st.image(album_art, use_container_width=True)
-    with cols[1]:
-        st.markdown(
-            f"""
-            <div class="song-card">
-                <div class="title">🎧 {name} {badge}</div>
-                <div class="meta">{artists} &nbsp;•&nbsp; {album} &nbsp;•&nbsp; Popularity: {popularity}</div>
-                <div style="margin-top:8px;">
-                    <a href="{spotify_url}" target="_blank" style="
-                        color:#1DB954 !important; font-weight:600; text-decoration:none; font-size:13px;
-                    ">🔗 Open in Spotify</a>
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    st.markdown(
-        f"""
-        <iframe style="border-radius:12px" src="https://open.spotify.com/embed/track/{track_id}"
-            width="100%" height="80" frameborder="0" allowfullscreen=""
-            allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture"
-            loading="lazy"></iframe>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
-
-
-if search_clicked and query.strip():
-    with st.spinner("Searching Spotify..."):
-        results = search_tracks(query, GENRE_HINTS[genre_choice])
-
-    if not results:
-        st.warning("No results found. Try a different spelling or a broader search term.")
+    if recs.empty:
+        st.warning("Sorry, couldn't find that song. Try another one.")
     else:
-        st.session_state["last_results"] = results
-        st.session_state["last_query"] = query
-
-if "last_results" in st.session_state and st.session_state["last_results"]:
-    st.markdown(f"### Results for **{st.session_state['last_query']}**")
-    for t in st.session_state["last_results"]:
-        render_track_card(t)
-
-    st.markdown("---")
-    st.markdown("### 🔁 Discover more")
-    pick_names = [f"{t['name']} - {t['artists'][0]['name']}" for t in st.session_state["last_results"]]
-    picked = st.selectbox("Pick a track to explore more around it:", options=pick_names)
-
-    if st.button("🚀 Show more like this"):
-        picked_track = st.session_state["last_results"][pick_names.index(picked)]
-        artist_id = picked_track["artists"][0]["id"]
-        album_id = picked_track["album"]["id"]
-
-        with st.spinner("Finding more tracks..."):
-            top_tracks_data = spotify_get(f"artists/{artist_id}/top-tracks", params={"market": "IN"})
-            album_tracks_data = spotify_get(f"albums/{album_id}/tracks", params={"market": "IN", "limit": 10})
-
-        if top_tracks_data:
-            top_tracks = [t for t in top_tracks_data.get("tracks", []) if t["id"] != picked_track["id"]][:5]
-            if top_tracks:
-                st.markdown(f"**More from {picked_track['artists'][0]['name']}:**")
-                for t in top_tracks:
-                    render_track_card(t)
-
-        if album_tracks_data:
-            album_track_items = album_tracks_data.get("items", [])
-            other_album_tracks = [t for t in album_track_items if t["id"] != picked_track["id"]][:5]
-            if other_album_tracks:
-                st.markdown(f"**Also from the album _{picked_track['album']['name']}_:**")
-                for t in other_album_tracks:
-                    # album track objects from this endpoint lack 'album'/'popularity' keys — patch them in
-                    t["album"] = picked_track["album"]
-                    t.setdefault("popularity", "—")
-                    render_track_card(t)
+        st.markdown(f"### Songs similar to **{selected_song}**")
+        for _, row in recs.iterrows():
+            singer = row["singer"].split("|")[0] if isinstance(row["singer"], str) else "Unknown"
+            search_query = urllib.parse.quote(f"{row['song_name']} {singer}")
+            spotify_url = f"https://open.spotify.com/search/{search_query}"
+            st.markdown(
+                f"""
+                <div class="song-card">
+                    <div class="title">🎧 {row['display_name']}</div>
+                    <div class="meta">
+                        {singer} &nbsp;•&nbsp; {row['language']} &nbsp;•&nbsp; Match: {row['match %']}%
+                    </div>
+                    <div style="margin-top: 8px;">
+                        <a href="{spotify_url}" target="_blank" style="
+                            display: inline-flex;
+                            align-items: center;
+                            gap: 6px;
+                            font-size: 13px;
+                            font-weight: 600;
+                            color: #1DB954 !important;
+                            text-decoration: none;
+                        ">🔗 Find on Spotify</a>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
 st.markdown("---")
-st.caption(
-    "Powered by the Spotify Web API. Note: Spotify retired its audio-similarity "
-    "and recommendations endpoints for new apps in late 2024, so 'more like this' "
-    "here is based on the same artist and album rather than audio-feature matching."
-)
+st.caption(f"Dataset: {len(songs_df)} songs across {songs_df['language'].nunique()} language(s).")
